@@ -13,7 +13,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     net::TcpStream,
@@ -40,7 +40,9 @@ use tracing::{debug, error, info, warn};
 use super::{
     config::{AgentConnector, ConfigurationWebsocketApi, ConfigurationWebsocketStreams},
     errors::{WebsocketConnectionFailureReason, WebsocketError},
-    models::{StreamId, WebsocketApiResponse, WebsocketEvent, WebsocketMode},
+    models::{
+        StreamId, WebsocketApiResponse, WebsocketEvent, WebsocketMessageEvent, WebsocketMode,
+    },
     utils::{build_websocket_api_message, normalize_stream_id, random_string, validate_time_unit},
 };
 
@@ -168,6 +170,61 @@ impl WebsocketEventEmitter {
     }
 }
 
+struct WebsocketMessageEventEmitter {
+    subscribers: Arc<std::sync::Mutex<Vec<UnboundedSender<WebsocketMessageEvent>>>>,
+}
+
+impl WebsocketMessageEventEmitter {
+    fn new() -> Self {
+        Self {
+            subscribers: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn subscribe<F>(&self, mut callback: F) -> Subscription
+    where
+        F: FnMut(WebsocketMessageEvent) + Send + 'static,
+    {
+        let (tx, mut rx) = unbounded_channel();
+        let mut guard = match self.subscribers.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.push(tx);
+        drop(guard);
+
+        let handle = spawn(async move {
+            while let Some(event) = rx.recv().await {
+                callback(event);
+            }
+        });
+        Subscription { handle }
+    }
+
+    fn emit(&self, payload: &str, connection_id: &str, url_path: Option<&str>) {
+        let mut guard = match self.subscribers.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.is_empty() {
+            return;
+        }
+
+        let received_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| {
+                i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+            });
+        let event = WebsocketMessageEvent {
+            payload: payload.to_string(),
+            connection_id: connection_id.to_string(),
+            url_path: url_path.map(str::to_string),
+            received_at_ms,
+        };
+        guard.retain(|tx| tx.send(event.clone()).is_ok());
+    }
+}
+
 /// A trait defining the lifecycle and behavior of a WebSocket connection.
 ///
 /// This trait provides methods for handling WebSocket connection events,
@@ -272,6 +329,7 @@ struct ReconnectEntry {
 
 pub struct WebsocketCommon {
     pub events: WebsocketEventEmitter,
+    message_events: WebsocketMessageEventEmitter,
     mode: WebsocketMode,
     round_robin_index: AtomicUsize,
     connection_pool: Vec<Arc<WebsocketConnection>>,
@@ -303,6 +361,7 @@ impl WebsocketCommon {
 
         let common = Arc::new(Self {
             events: WebsocketEventEmitter::new(),
+            message_events: WebsocketMessageEventEmitter::new(),
             mode,
             round_robin_index: AtomicUsize::new(0),
             connection_pool: initial_pool,
@@ -317,6 +376,19 @@ impl WebsocketCommon {
         Self::spawn_renewal_loop(&Arc::clone(&common), renewal_rx);
 
         common
+    }
+
+    /// Subscribes to text messages with their physical connection metadata.
+    ///
+    /// The existing [`WebsocketEvent::Message`] event remains unchanged for
+    /// backwards compatibility. This source-aware subscription is intended for
+    /// consumers that need to distinguish URL namespaces or connection-pool
+    /// members.
+    pub fn subscribe_on_message_events<F>(&self, callback: F) -> Subscription
+    where
+        F: FnMut(WebsocketMessageEvent) + Send + 'static,
+    {
+        self.message_events.subscribe(callback)
     }
 
     /// Spawns an asynchronous loop to handle websocket reconnection attempts
@@ -730,7 +802,12 @@ impl WebsocketCommon {
     /// - If a connection handler exists, awaits its `on_message` method
     /// - Emits a `WebsocketEvent::Message` event with the received message
     async fn on_message(&self, msg: String, connection: Arc<WebsocketConnection>) {
-        let handler = connection.state.lock().await.handler.clone();
+        let (handler, url_path) = {
+            let state = connection.state.lock().await;
+            (state.handler.clone(), state.url_path.clone())
+        };
+        self.message_events
+            .emit(&msg, &connection.id, url_path.as_deref());
         if let Some(handler) = handler {
             handler
                 .on_message(msg.clone(), Arc::clone(&connection))
@@ -2991,8 +3068,8 @@ mod tests {
     use crate::common::websocket::{
         PendingRequest, ReconnectEntry, SendWebsocketMessageResult, WebsocketApi, WebsocketBase,
         WebsocketCommon, WebsocketConnection, WebsocketEvent, WebsocketEventEmitter,
-        WebsocketHandler, WebsocketMessageSendOptions, WebsocketMode, WebsocketSessionLogonReq,
-        WebsocketStream, WebsocketStreams, create_stream_handler,
+        WebsocketHandler, WebsocketMessageEventEmitter, WebsocketMessageSendOptions, WebsocketMode,
+        WebsocketSessionLogonReq, WebsocketStream, WebsocketStreams, create_stream_handler,
     };
     use crate::config::{ConfigurationWebsocketApi, ConfigurationWebsocketStreams, PrivateKey};
     use crate::errors::{WebsocketConnectionFailureReason, WebsocketError};
@@ -4192,6 +4269,40 @@ mod tests {
             }
 
             #[test]
+            fn emits_message_with_connection_metadata() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let conn = WebsocketConnection::new("connection-1");
+                    conn.state.lock().await.url_path = Some("public".to_string());
+                    let common = WebsocketCommon::new(
+                        vec![conn.clone()],
+                        WebsocketMode::Single,
+                        0,
+                        None,
+                        None,
+                    );
+                    let (tx, rx) = oneshot::channel();
+                    let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
+                    let callback_tx = Arc::clone(&tx);
+                    let _subscription = common.subscribe_on_message_events(move |event| {
+                        if let Some(tx) = callback_tx.lock().unwrap().take() {
+                            let _ = tx.send(event);
+                        }
+                    });
+
+                    common.on_message("payload".into(), conn).await;
+
+                    let event = timeout(Duration::from_millis(100), rx)
+                        .await
+                        .expect("timed out")
+                        .expect("message callback dropped");
+                    assert_eq!(event.payload, "payload");
+                    assert_eq!(event.connection_id, "connection-1");
+                    assert_eq!(event.url_path.as_deref(), Some("public"));
+                    assert!(event.received_at_ms > 0);
+                });
+            }
+
+            #[test]
             fn calls_handler_and_emits_message() {
                 TOKIO_SHARED_RT.block_on(async {
                     let conn = WebsocketConnection::new("c2");
@@ -4935,6 +5046,7 @@ mod tests {
                     let (renewal_tx, _renewal_rx) = channel::<(String, String)>(1);
                     let common = Arc::new(WebsocketCommon {
                         events: WebsocketEventEmitter::new(),
+                        message_events: WebsocketMessageEventEmitter::new(),
                         mode: WebsocketMode::Single,
                         round_robin_index: AtomicUsize::new(0),
                         connection_pool: vec![conn.clone()],

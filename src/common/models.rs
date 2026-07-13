@@ -188,6 +188,15 @@ pub enum WebsocketEvent {
     Pong,
 }
 
+/// A WebSocket text message together with its physical connection metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebsocketMessageEvent {
+    pub payload: String,
+    pub connection_id: String,
+    pub url_path: Option<String>,
+    pub received_at_ms: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum WebsocketMode {
     Single,

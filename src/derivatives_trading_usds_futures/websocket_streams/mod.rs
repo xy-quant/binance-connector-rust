@@ -21,7 +21,7 @@ use crate::common::websocket::{
     Subscription, WebsocketBase, WebsocketStream, WebsocketStreams as WebsocketStreamsBase,
     create_stream_handler,
 };
-use crate::models::{StreamId, WebsocketEvent, WebsocketMode};
+use crate::models::{StreamId, WebsocketEvent, WebsocketMessageEvent, WebsocketMode};
 
 mod apis;
 mod handle;
@@ -32,6 +32,35 @@ pub use handle::*;
 pub use models::*;
 
 const HAS_TIME_UNIT: bool = false;
+
+/// URL namespace used by a USD-M Futures WebSocket Streams connection.
+///
+/// Binance separates stream families across distinct URL paths. Selecting one
+/// path allows callers to isolate unrelated stream families on independent
+/// physical connections instead of opening every supported namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebsocketStreamPath {
+    Market,
+    Public,
+    Private,
+}
+
+impl WebsocketStreamPath {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Market => "market",
+            Self::Public => "public",
+            Self::Private => "private",
+        }
+    }
+}
+
+const ALL_WEBSOCKET_STREAM_PATHS: [WebsocketStreamPath; 3] = [
+    WebsocketStreamPath::Market,
+    WebsocketStreamPath::Public,
+    WebsocketStreamPath::Private,
+];
 
 pub struct WebsocketStreams {
     websocket_streams_base: Arc<WebsocketStreamsBase>,
@@ -45,6 +74,32 @@ impl WebsocketStreams {
         streams: Vec<String>,
         mode: Option<WebsocketMode>,
     ) -> anyhow::Result<Self> {
+        Self::connect_with_paths(
+            config,
+            streams,
+            mode,
+            ALL_WEBSOCKET_STREAM_PATHS
+                .into_iter()
+                .map(WebsocketStreamPath::as_str),
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_to_path(
+        config: ConfigurationWebsocketStreams,
+        path: WebsocketStreamPath,
+        streams: Vec<String>,
+        mode: Option<WebsocketMode>,
+    ) -> anyhow::Result<Self> {
+        Self::connect_with_paths(config, streams, mode, [path.as_str()]).await
+    }
+
+    async fn connect_with_paths(
+        config: ConfigurationWebsocketStreams,
+        streams: Vec<String>,
+        mode: Option<WebsocketMode>,
+        paths: impl IntoIterator<Item = &'static str>,
+    ) -> anyhow::Result<Self> {
         let mut cfg = config;
         if let Some(m) = mode {
             cfg.mode = m;
@@ -54,15 +109,8 @@ impl WebsocketStreams {
             cfg.time_unit = None;
         }
 
-        let websocket_streams_base = WebsocketStreamsBase::new(
-            cfg,
-            vec![],
-            vec![
-                "market".to_string(),
-                "public".to_string(),
-                "private".to_string(),
-            ],
-        );
+        let url_paths = paths.into_iter().map(str::to_string).collect();
+        let websocket_streams_base = WebsocketStreamsBase::new(cfg, vec![], url_paths);
 
         websocket_streams_base.clone().connect(streams).await?;
 
@@ -96,6 +144,21 @@ impl WebsocketStreams {
     {
         let base = Arc::clone(&self.websocket_streams_base);
         base.common.events.subscribe(callback)
+    }
+
+    /// Subscribes to raw text messages with connection ID, URL namespace and
+    /// local receive time.
+    ///
+    /// Use this method when transport provenance matters. The existing
+    /// [`Self::subscribe_on_ws_events`] API remains available for callers that
+    /// only need the payload.
+    pub fn subscribe_on_ws_message_events<F>(&self, callback: F) -> Subscription
+    where
+        F: FnMut(WebsocketMessageEvent) + Send + 'static,
+    {
+        self.websocket_streams_base
+            .common
+            .subscribe_on_message_events(callback)
     }
 
     /// Unsubscribes from WebSocket events for a given `Subscription`.

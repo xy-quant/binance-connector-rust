@@ -4,7 +4,8 @@ use tracing::info;
 
 use binance_sdk::config::ConfigurationWebsocketStreams;
 use binance_sdk::derivatives_trading_usds_futures::{
-    DerivativesTradingUsdsFuturesWsStreams, websocket_streams::DiffBookDepthStreamsParams,
+    DerivativesTradingUsdsFuturesWsStreams,
+    websocket_streams::{DiffBookDepthStreamsParams, WebsocketStreamPath},
 };
 use binance_sdk::logger;
 
@@ -21,7 +22,7 @@ async fn main() -> Result<()> {
 
     // Connect to WebSocket
     let connection = ws_streams_client
-        .connect()
+        .connect_to_path(WebsocketStreamPath::Public)
         .await
         .context("Failed to connect to WebSocket Streams")?;
 

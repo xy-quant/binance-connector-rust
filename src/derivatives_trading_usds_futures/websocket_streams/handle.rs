@@ -13,7 +13,7 @@
 
 use crate::{common::config::ConfigurationWebsocketStreams, models::WebsocketStreamsConnectConfig};
 
-use super::WebsocketStreams;
+use super::{WebsocketStreamPath, WebsocketStreams};
 
 #[derive(Clone)]
 pub struct WebsocketStreamsHandle {
@@ -74,5 +74,105 @@ impl WebsocketStreamsHandle {
         cfg: WebsocketStreamsConnectConfig,
     ) -> anyhow::Result<WebsocketStreams> {
         WebsocketStreams::connect(self.configuration.clone(), cfg.streams, cfg.mode).await
+    }
+
+    /// Connects only to the selected WebSocket Streams URL namespace.
+    ///
+    /// Unlike [`Self::connect`], this method creates no connections for the
+    /// other supported namespaces. Operations used on the returned client must
+    /// belong to `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`anyhow::Error`] if the connection fails.
+    pub async fn connect_to_path(
+        &self,
+        path: WebsocketStreamPath,
+    ) -> anyhow::Result<WebsocketStreams> {
+        self.connect_to_path_with_config(path, WebsocketStreamsConnectConfig::default())
+            .await
+    }
+
+    /// Connects only to the selected WebSocket Streams URL namespace using a
+    /// custom stream list and connection mode.
+    ///
+    /// This is useful when independent stream families need separate physical
+    /// connections. For example, callers can create one `Market` connection
+    /// and one `Public` connection without opening an unused `Private`
+    /// connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`anyhow::Error`] if the connection fails.
+    pub async fn connect_to_path_with_config(
+        &self,
+        path: WebsocketStreamPath,
+        cfg: WebsocketStreamsConnectConfig,
+    ) -> anyhow::Result<WebsocketStreams> {
+        WebsocketStreams::connect_to_path(self.configuration.clone(), path, cfg.streams, cfg.mode)
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::StreamExt;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{
+        accept_hdr_async,
+        tungstenite::handshake::server::{Request, Response},
+    };
+
+    use crate::{
+        TOKIO_SHARED_RT, common::config::ConfigurationWebsocketStreams,
+        models::WebsocketStreamsConnectConfig,
+    };
+
+    use super::*;
+
+    #[test]
+    fn connects_only_to_selected_path() {
+        TOKIO_SHARED_RT.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let callback = |request: &Request, response: Response| {
+                    assert_eq!(
+                        request.uri().to_string(),
+                        "/public/stream?streams=ethusdt@depth@0ms"
+                    );
+                    Ok(response)
+                };
+                let mut websocket = accept_hdr_async(stream, callback).await.unwrap();
+                while websocket.next().await.is_some() {}
+            });
+            let configuration = ConfigurationWebsocketStreams::builder()
+                .ws_url(format!("ws://{address}"))
+                .build()
+                .unwrap();
+            let handle = WebsocketStreamsHandle::new(configuration);
+
+            let connection = handle
+                .connect_to_path_with_config(
+                    WebsocketStreamPath::Public,
+                    WebsocketStreamsConnectConfig {
+                        streams: vec!["ethusdt@depth@0ms".to_string()],
+                        mode: None,
+                    },
+                )
+                .await
+                .unwrap();
+
+            connection.disconnect().await.unwrap();
+            server.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn path_names_are_stable() {
+        assert_eq!(WebsocketStreamPath::Market.as_str(), "market");
+        assert_eq!(WebsocketStreamPath::Public.as_str(), "public");
+        assert_eq!(WebsocketStreamPath::Private.as_str(), "private");
     }
 }
